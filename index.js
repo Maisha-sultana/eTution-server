@@ -4,8 +4,9 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 require('dotenv').config();
-const { MongoClient, ServerApiVersion } = require('mongodb');
-const jwt = require('jsonwebtoken'); // <--- NEW IMPORT
+// CHANGED: ObjectId imported to correctly sort by creation time
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb'); 
+const jwt = require('jsonwebtoken'); 
 const port = process.env.PORT || 3000
 
 // middleware
@@ -24,6 +25,9 @@ const client = new MongoClient(uri, {
 });
 
 let userCollection; 
+let tuitionsCollection; 
+let tutorProfilesCollection; 
+
 
 async function run() {
   try {
@@ -32,7 +36,24 @@ async function run() {
     const db=client.db('tution_db');
 
     userCollection = db.collection('users');
-
+    tuitionsCollection = db.collection('tuitions');
+    tutorProfilesCollection = db.collection('tutorProfiles');
+    
+    // Seed sample data if collections are empty (for fresh data on first run)
+    const tuitionCount = await tuitionsCollection.countDocuments();
+    if (tuitionCount === 0) {
+        await tuitionsCollection.insertMany(sampleTuitions);
+        console.log("Inserted 15 sample tuition posts.");
+    }
+    
+    const tutorCount = await tutorProfilesCollection.countDocuments();
+    if (tutorCount === 0) {
+        await tutorProfilesCollection.insertMany(sampleTutors);
+        console.log("Inserted 10 sample tutor profiles.");
+    }
+    
+    // ... [existing /users and /jwt routes remain the same]
+    
     // API Endpoint to Save User Profile on Registration/Social Login
     app.post('/users', async (req, res) => {
         const user = req.body;
@@ -47,7 +68,7 @@ async function run() {
         res.send(result);
     });
     
-    // API Endpoint to Generate and Send JWT Token <--- NEW ROUTE
+    // API Endpoint to Generate and Send JWT Token 
     app.post('/jwt', async (req, res) => {
         const user = req.body;
         
@@ -66,6 +87,28 @@ async function run() {
         
         // 4. Send the token back to the client
         res.send({ token });
+    });
+
+    // NEW API: Get Latest 6 Tuition Posts for Home Page (CHANGED TO POST ROUTE)
+    app.post('/latest-tuitions', async (req, res) => { // CHANGED FROM app.get
+        // Sort by 'createdAt' time (descending) and limit to 6
+        const latestTuitions = await tuitionsCollection
+            .find({})
+            .sort({ createdAt: -1 }) 
+            .limit(6)
+            .toArray();
+        res.send(latestTuitions);
+    });
+
+    // NEW API: Get Latest 3 Tutor Profiles for Home Page (CHANGED TO POST ROUTE)
+    app.post('/latest-tutors', async (req, res) => { // CHANGED FROM app.get
+        // Sort by 'createdAt' time (descending) and limit to 3
+        const latestTutors = await tutorProfilesCollection
+            .find({})
+            .sort({ createdAt: -1 }) 
+            .limit(3)
+            .toArray();
+        res.send(latestTutors);
     });
 
 
