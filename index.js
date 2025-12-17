@@ -5,7 +5,8 @@ const cors = require('cors');
 const app = express();
 require('dotenv').config();
 // CHANGED: ObjectId imported to correctly sort by creation time
-const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb'); 
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY); 
 const jwt = require('jsonwebtoken'); 
 const port = process.env.PORT || 3000
 
@@ -38,6 +39,47 @@ async function run() {
     userCollection = db.collection('users');
     tuitionsCollection = db.collection('tuitions');
     tutorProfilesCollection = db.collection('tutorProfiles');
+    const applicationsCollection = db.collection('applications'); // New
+    const paymentsCollection = db.collection('payments'); // New
+
+    // --- STRIPE PAYMENT INTENT ---
+    app.post('/create-payment-intent', async (req, res) => {
+        const { price } = req.body;
+        if (!price || price < 1) return res.status(400).send({ message: "Invalid price" });
+        
+        const amount = parseInt(price * 100); // Stripe counts in cents
+        const paymentIntent = await stripe.paymentIntents.create({
+            amount: amount,
+            currency: 'bdt',
+            payment_method_types: ['card'],
+        });
+        res.send({ clientSecret: paymentIntent.client_secret });
+    });
+
+    // --- SAVE PAYMENT & UPDATE STATUS ---
+    app.post('/payments', async (req, res) => {
+        const payment = req.body;
+        
+        // 1. Save to payments collection
+        const paymentResult = await paymentsCollection.insertOne(payment);
+
+        // 2. Update Application Status to 'Approved'
+        const appQuery = { _id: new ObjectId(payment.applicationId) };
+        await applicationsCollection.updateOne(appQuery, { $set: { status: 'Approved' } });
+
+        // 3. Close the Tuition Post
+        const tuitionQuery = { _id: new ObjectId(payment.tuitionId) };
+        await tuitionsCollection.updateOne(tuitionQuery, { $set: { status: 'Closed' } });
+
+        res.send(paymentResult);
+    });
+
+    // --- GET APPLICATIONS FOR STUDENT ---
+    app.get('/applied-tutors/:email', async (req, res) => {
+        const email = req.params.email;
+        const result = await applicationsCollection.find({ studentEmail: email }).toArray();
+        res.send(result);
+    });
     
     // Seed sample data if collections are empty (for fresh data on first run)
     const tuitionCount = await tuitionsCollection.countDocuments();
@@ -89,7 +131,6 @@ async function run() {
         res.send({ token });
     });
 
-    // NEW API: Get Latest 6 Tuition Posts for Home Page (CHANGED TO POST ROUTE)
     app.post('/latest-tuitions', async (req, res) => { // CHANGED FROM app.get
         // Sort by 'createdAt' time (descending) and limit to 6
         const latestTuitions = await tuitionsCollection
@@ -104,7 +145,6 @@ async function run() {
     app.post('/tuition', async (req, res) => {
         const post = req.body;
         
-        // Ensure required fields like studentEmail are present (assuming this comes from AuthContext/body)
         if (!post.studentEmail || !post.subject) {
             return res.status(400).send({ message: "Missing required fields." });
         }
@@ -128,7 +168,6 @@ async function run() {
         }
     });
 
-    // NEW API: Get Tuitions by Student Email (READ - My Tuitions)
     app.post('/my-tuitions', async (req, res) => {
         const { email } = req.body;
         if (!email) {
@@ -146,7 +185,6 @@ async function run() {
         }
     });
     
-    // NEW API: Update a Tuition Post (UPDATE)
     app.put('/tuition/:id', async (req, res) => {
         const id = req.params.id;
         const updatedPost = req.body;
@@ -198,7 +236,6 @@ async function run() {
         }
     });
     
-    // NEW API: Get Latest 3 Tutor Profiles for Home Page (CHANGED TO POST ROUTE)
     app.post('/latest-tutors', async (req, res) => { // CHANGED FROM app.get
         // Sort by 'createdAt' time (descending) and limit to 3
         const latestTutors = await tutorProfilesCollection
