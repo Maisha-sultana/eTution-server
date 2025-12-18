@@ -41,39 +41,110 @@ async function run() {
     tutorProfilesCollection = db.collection('tutorProfiles');
     const applicationsCollection = db.collection('applications'); // New
     const paymentsCollection = db.collection('payments'); // New
+     
+    // index.js (Add these inside your run() function)
 
-    // --- STRIPE PAYMENT INTENT ---
-    app.post('/create-payment-intent', async (req, res) => {
-        const { price } = req.body;
-        if (!price || price < 1) return res.status(400).send({ message: "Invalid price" });
-        
-        const amount = parseInt(price * 100); // Stripe counts in cents
-        const paymentIntent = await stripe.paymentIntents.create({
-            amount: amount,
-            currency: 'bdt',
+// 1. Submit Application
+app.post('/applications', async (req, res) => {
+    const application = req.body;
+    // Check if tutor already applied
+    const query = { tuitionId: application.tuitionId, tutorEmail: application.tutorEmail };
+    const existing = await applicationsCollection.findOne(query);
+    if (existing) return res.status(400).send({ message: "Already applied!" });
+
+    const result = await applicationsCollection.insertOne({
+        ...application,
+        status: 'Pending',
+        appliedAt: new Date()
+    });
+    res.send(result);
+});
+
+// 2. Get Tutor's Applications
+app.get('/tutor-applications/:email', async (req, res) => {
+    const email = req.params.email;
+    const result = await applicationsCollection.find({ tutorEmail: email }).toArray();
+    res.send(result);
+});
+
+// 3. Delete Application (Before approval)
+app.delete('/application-cancel/:id', async (req, res) => {
+    const id = req.params.id;
+    const result = await applicationsCollection.deleteOne({ _id: new ObjectId(id), status: 'Pending' });
+    res.send(result);
+});
+
+// 4. Get Ongoing Tuitions (Approved ones)
+app.get('/ongoing-tuitions/:email', async (req, res) => {
+    const email = req.params.email;
+    const result = await applicationsCollection.find({ tutorEmail: email, status: 'Approved' }).toArray();
+    res.send(result);
+});
+   // index.js
+app.post('/create-checkout-session', async (req, res) => {
+    const { applicationId, amount, tutorName, studentEmail } = req.body;
+    
+    try {
+        const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
+            line_items: [{
+                price_data: {
+                    currency: 'bdt',
+                    unit_amount: parseInt(amount * 100), // Stripe uses cents
+                    product_data: { name: `Hire Tutor: ${tutorName}` },
+                },
+                quantity: 1,
+            }],
+            mode: 'payment',
+            customer_email: studentEmail,
+            metadata: { applicationId: applicationId }, // Required for verify step
+            success_url: `${process.env.SITE_DOMAIN}/dashboard/student/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${process.env.SITE_DOMAIN}/dashboard/student/payment-cancelled`,
         });
-        res.send({ clientSecret: paymentIntent.client_secret });
+        res.send({ url: session.url });
+    } catch (error) {
+        console.error("Stripe Error:", error.message);
+        res.status(500).send({ message: error.message });
+    }
+});
+
+    // --- PAYMENT VERIFICATION & DB UPDATE ---
+    app.patch('/payment-verify', async (req, res) => {
+        const { session_id } = req.query;
+        try {
+            const session = await stripe.checkout.sessions.retrieve(session_id);
+            if (session.payment_status === 'paid') {
+                const appId = session.metadata.applicationId;
+                
+                // 1. Save Payment Record
+                const payment = {
+                    transactionId: session.payment_intent,
+                    amount: session.amount_total / 100,
+                    studentEmail: session.customer_email,
+                    applicationId: appId,
+                    date: new Date()
+                };
+                await paymentsCollection.insertOne(payment);
+
+                // 2. Update Application Status
+                const app = await applicationsCollection.findOneAndUpdate(
+                    { _id: new ObjectId(appId) },
+                    { $set: { status: 'Approved' } }
+                );
+
+                // 3. Close Tuition Post
+                if (app.value?.tuitionId) {
+                    await tuitionsCollection.updateOne(
+                        { _id: new ObjectId(app.value.tuitionId) },
+                        { $set: { status: 'Closed' } }
+                    );
+                }
+                res.send({ success: true });
+            }
+        } catch (error) {
+            res.status(500).send({ message: "Verification failed" });
+        }
     });
-
-    // --- SAVE PAYMENT & UPDATE STATUS ---
-    app.post('/payments', async (req, res) => {
-        const payment = req.body;
-        
-        // 1. Save to payments collection
-        const paymentResult = await paymentsCollection.insertOne(payment);
-
-        // 2. Update Application Status to 'Approved'
-        const appQuery = { _id: new ObjectId(payment.applicationId) };
-        await applicationsCollection.updateOne(appQuery, { $set: { status: 'Approved' } });
-
-        // 3. Close the Tuition Post
-        const tuitionQuery = { _id: new ObjectId(payment.tuitionId) };
-        await tuitionsCollection.updateOne(tuitionQuery, { $set: { status: 'Closed' } });
-
-        res.send(paymentResult);
-    });
-
     // --- GET APPLICATIONS FOR STUDENT ---
     app.get('/applied-tutors/:email', async (req, res) => {
         const email = req.params.email;
@@ -131,6 +202,52 @@ async function run() {
         res.send({ token });
     });
 
+    app.get('/all-tuitions', async (req, res) => {
+    try {
+        const allTuitions = await tuitionsCollection
+            .find({})
+            .sort({ createdAt: -1 }) 
+            .toArray();
+        res.send(allTuitions);
+    } catch (error) {
+        res.status(500).send({ message: "Failed to fetch all tuitions" });
+    }
+});
+     app.get('/tuition/:id', async (req, res) => {
+    const id = req.params.id;
+    const query = { _id: new ObjectId(id) };
+    const result = await tuitionsCollection.findOne(query);
+    res.send(result);
+});
+
+// Get Ongoing Tuitions for Tutor (Approved status)
+app.get('/tutor/ongoing/:email', async (req, res) => {
+    const email = req.params.email;
+    const result = await applicationsCollection.find({ 
+        tutorEmail: email, 
+        status: 'Approved' 
+    }).toArray();
+    res.send(result);
+});
+
+// Get Revenue History for Tutor (Payments linked to tutor's email)
+app.get('/tutor/revenue/:email', async (req, res) => {
+    const email = req.params.email;
+    // We find payments where the application linked to the payment belongs to this tutor
+    const payments = await paymentsCollection.aggregate([
+        {
+            $lookup: {
+                from: 'applications',
+                localField: 'applicationId',
+                foreignField: '_id',
+                as: 'appDetails'
+            }
+        },
+        { $unwind: '$appDetails' },
+        { $match: { 'appDetails.tutorEmail': email } }
+    ]).toArray();
+    res.send(payments);
+});
     app.post('/latest-tuitions', async (req, res) => { // CHANGED FROM app.get
         // Sort by 'createdAt' time (descending) and limit to 6
         const latestTuitions = await tuitionsCollection
