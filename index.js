@@ -41,8 +41,78 @@ async function run() {
     tutorProfilesCollection = db.collection('tutorProfiles');
     const applicationsCollection = db.collection('applications'); // New
     const paymentsCollection = db.collection('payments'); // New
+
+    app.get('/all-tutors', async (req, res) => {
+    try {
+        const result = await tutorProfilesCollection.find().toArray();
+        res.send(result);
+    } catch (error) {
+        res.status(500).send({ message: "Failed to fetch tutors" });
+    }
+});
      
+    app.get('/admin/all-tuitions', async (req, res) => {
+    const result = await tuitionsCollection.find().sort({ createdAt: -1 }).toArray();
+    res.send(result);
+});
+
+// Update tuition status (Approve/Reject)
+app.patch('/admin/tuition-status/:id', async (req, res) => {
+    const id = req.params.id;
+    const { status } = req.body; // 'Approved' or 'Rejected'
+    const result = await tuitionsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status: status } }
+    );
+    res.send(result);
+});
+
+// --- ADMIN: Reports & Analytics ---
+app.get('/admin/stats', async (req, res) => {
+    const totalEarnings = await paymentsCollection.aggregate([
+        { $group: { _id: null, total: { $sum: "$amount" } } }
+    ]).toArray();
+
+    const totalUsers = await userCollection.countDocuments();
+    const totalTuitions = await tuitionsCollection.countDocuments();
+    const transactions = await paymentsCollection.find().sort({ date: -1 }).toArray();
+
+    res.send({
+        totalEarnings: totalEarnings[0]?.total || 0,
+        totalUsers,
+        totalTuitions,
+        transactions
+    });
+});
     // index.js (Add these inside your run() function)
+    app.get('/users', async (req, res) => {
+    const result = await userCollection.find().toArray();
+    res.send(result);
+});
+
+// 2. Update User Information/Role
+app.patch('/users/:id', async (req, res) => {
+    const id = req.params.id;
+    const filter = { _id: new ObjectId(id) };
+    const updatedUser = req.body;
+    const updateDoc = {
+        $set: {
+            name: updatedUser.name,
+            phone: updatedUser.phone,
+            role: updatedUser.role,
+            status: updatedUser.status // e.g., 'Verified' or 'Blocked'
+        },
+    };
+    const result = await userCollection.updateOne(filter, updateDoc);
+    res.send(result);
+});
+
+// 3. Delete User Account
+app.delete('/users/:id', async (req, res) => {
+    const id = req.params.id;
+    const result = await userCollection.deleteOne({ _id: new ObjectId(id) });
+    res.send(result);
+});
 
 // 1. Submit Application
 app.post('/applications', async (req, res) => {
