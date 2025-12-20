@@ -42,6 +42,107 @@ async function run() {
     const applicationsCollection = db.collection('applications'); // New
     const paymentsCollection = db.collection('payments'); // New
 
+    app.get('/tutor/revenue/:email', async (req, res) => {
+    const email = req.params.email;
+    try {
+        const payments = await paymentsCollection.aggregate([
+            {
+                $addFields: {
+                    // Convert applicationId string to ObjectId for lookup
+                    appIdObj: { $toObjectId: "$applicationId" }
+                }
+            },
+            {
+                $lookup: {
+                    from: 'applications',
+                    localField: 'appIdObj',
+                    foreignField: '_id',
+                    as: 'appDetails'
+                }
+            },
+            { $unwind: '$appDetails' },
+            { $match: { 'appDetails.tutorEmail': email } },
+            {
+                $project: {
+                    _id: 1,
+                    transactionId: 1,
+                    amount: 1,
+                    date: 1,
+                    subject: "$appDetails.subject",
+                    studentEmail: 1
+                }
+            }
+        ]).toArray();
+        res.send(payments);
+    } catch (error) {
+        res.status(500).send({ message: "Failed to fetch revenue" });
+    }
+});
+
+app.get('/student-profile/:email', async (req, res) => {
+    const email = req.params.email;
+    try {
+        const result = await userCollection.findOne({ email: email });
+        res.send(result || {});
+    } catch (error) {
+        res.status(500).send({ message: "Error fetching student profile" });
+    }
+});
+
+// স্টুডেন্ট প্রোফাইল আপডেট করা
+app.patch('/student-profile-update', async (req, res) => {
+    const profile = req.body;
+    const filter = { email: profile.email };
+    const updateDoc = {
+        $set: {
+            name: profile.name,
+            phone: profile.phone,
+            institution: profile.institution, // নতুন ফিল্ড
+            address: profile.address,         // নতুন ফিল্ড
+            lastUpdated: new Date()
+        },
+    };
+    try {
+        const result = await userCollection.updateOne(filter, updateDoc);
+        res.send(result);
+    } catch (error) {
+        res.status(500).send({ message: "Update failed" });
+    }
+});
+
+  app.get('/tutor-profile/:email', async (req, res) => {
+    const email = req.params.email;
+    try {
+        const result = await tutorProfilesCollection.findOne({ tutorEmail: email });
+        // ডাটা না পাওয়া গেলে null এর পরিবর্তে {} পাঠান
+        res.send(result || {}); 
+    } catch (error) {
+        res.status(500).send({ message: "Error fetching profile" });
+    }
+});
+
+
+
+// 2. Tutor Profile Create ba Update kora (Upsert use kora hoyeche)
+app.patch('/tutor-profile-update', async (req, res) => {
+    const profile = req.body;
+    const filter = { tutorEmail: profile.tutorEmail };
+    const options = { upsert: true };
+    const updateDoc = {
+        $set: {
+            name: profile.name,
+            photo: profile.photo,
+            university: profile.university,
+            specialization: profile.specialization,
+            experience: profile.experience,
+            bio: profile.bio,
+            lastUpdated: new Date()
+        },
+    };
+    const result = await tutorProfilesCollection.updateOne(filter, updateDoc, options);
+    res.send(result);
+});
+
     app.get('/all-tutors', async (req, res) => {
     try {
         const result = await tutorProfilesCollection.find().toArray();
