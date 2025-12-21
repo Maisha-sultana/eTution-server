@@ -1,2 +1,4 @@
 node_modules
 .env
+e-tution-firebase-adminsdk.json
+.vercel

@@ -1,22 +1,24 @@
-// index.js (Backend)
-
 const express = require('express');
 const cors = require('cors');
 const app = express();
 require('dotenv').config();
-// CHANGED: ObjectId imported to correctly sort by creation time
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY); 
-const jwt = require('jsonwebtoken'); 
-const port = process.env.PORT || 3000
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const jwt = require('jsonwebtoken');
+const port = process.env.PORT || 3000;
+const admin = require("firebase-admin");
+
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8');
+const serviceAccount = JSON.parse(decoded);
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
 
 // middleware
 app.use(express.json());
 app.use(cors());
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.mjn1osb.mongodb.net/?appName=Cluster0`;
-
-
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -25,528 +27,625 @@ const client = new MongoClient(uri, {
   }
 });
 
-let userCollection; 
-let tuitionsCollection; 
-let tutorProfilesCollection; 
+// Global collections
+let userCollection;
+let tuitionsCollection;
+let tutorProfilesCollection;
+let applicationsCollection;
+let paymentsCollection;
 
-
-async function run() {
+// Database connection
+async function connectDB() {
   try {
     await client.connect();
-
-    const db=client.db('tution_db');
-
+    const db = client.db('tution_db');
     userCollection = db.collection('users');
     tuitionsCollection = db.collection('tuitions');
     tutorProfilesCollection = db.collection('tutorProfiles');
-    const applicationsCollection = db.collection('applications'); // New
-    const paymentsCollection = db.collection('payments'); // New
+    applicationsCollection = db.collection('applications');
+    paymentsCollection = db.collection('payments');
+    
+    console.log("✅ Successfully connected to MongoDB!");
+    return true;
+  } catch (error) {
+    console.error("❌ MongoDB connection failed:", error);
+    return false;
+  }
+}
 
-    app.get('/tutor/revenue/:email', async (req, res) => {
-    const email = req.params.email;
-    try {
-        const payments = await paymentsCollection.aggregate([
-            {
-                $addFields: {
-                    // Convert applicationId string to ObjectId for lookup
-                    appIdObj: { $toObjectId: "$applicationId" }
-                }
-            },
-            {
-                $lookup: {
-                    from: 'applications',
-                    localField: 'appIdObj',
-                    foreignField: '_id',
-                    as: 'appDetails'
-                }
-            },
-            { $unwind: '$appDetails' },
-            { $match: { 'appDetails.tutorEmail': email } },
-            {
-                $project: {
-                    _id: 1,
-                    transactionId: 1,
-                    amount: 1,
-                    date: 1,
-                    subject: "$appDetails.subject",
-                    studentEmail: 1
-                }
-            }
-        ]).toArray();
-        res.send(payments);
-    } catch (error) {
-        res.status(500).send({ message: "Failed to fetch revenue" });
-    }
+// Middleware to check DB connection
+const checkDBConnection = (req, res, next) => {
+  if (!userCollection) {
+    return res.status(503).send({ message: "Database not connected" });
+  }
+  next();
+};
+
+// Health check route (no DB needed)
+app.get('/', (req, res) => {
+  res.send('Tution server is running...');
 });
 
-app.get('/student-profile/:email', async (req, res) => {
-    const email = req.params.email;
-    try {
-        const result = await userCollection.findOne({ email: email });
-        res.send(result || {});
-    } catch (error) {
-        res.status(500).send({ message: "Error fetching student profile" });
-    }
+app.get('/health', (req, res) => {
+  res.send({ 
+    status: 'ok', 
+    dbConnected: !!userCollection,
+    timestamp: new Date().toISOString()
+  });
 });
 
-// স্টুডেন্ট প্রোফাইল আপডেট করা
-app.patch('/student-profile-update', async (req, res) => {
-    const profile = req.body;
-    const filter = { email: profile.email };
-    const updateDoc = {
-        $set: {
-            name: profile.name,
-            phone: profile.phone,
-            institution: profile.institution, // নতুন ফিল্ড
-            address: profile.address,         // নতুন ফিল্ড
-            lastUpdated: new Date()
-        },
-    };
-    try {
-        const result = await userCollection.updateOne(filter, updateDoc);
-        res.send(result);
-    } catch (error) {
-        res.status(500).send({ message: "Update failed" });
-    }
+app.use('/api', checkDBConnection);
+
+// ============ TUTOR ROUTES ============
+app.get('/tutor/revenue/:email', checkDBConnection, async (req, res) => {
+  const email = req.params.email;
+  try {
+    const payments = await paymentsCollection.aggregate([
+      { $addFields: { appIdObj: { $toObjectId: "$applicationId" } } },
+      { 
+        $lookup: { 
+          from: 'applications', 
+          localField: 'appIdObj', 
+          foreignField: '_id', 
+          as: 'appDetails' 
+        } 
+      },
+      { $unwind: '$appDetails' },
+      { $match: { 'appDetails.tutorEmail': email } },
+      { 
+        $project: { 
+          _id: 1, 
+          transactionId: 1, 
+          amount: 1, 
+          date: 1, 
+          subject: "$appDetails.subject", 
+          studentEmail: 1 
+        } 
+      }
+    ]).toArray();
+    res.send(payments);
+  } catch (error) {
+    console.error("Revenue fetch error:", error);
+    res.status(500).send({ message: "Failed to fetch revenue" });
+  }
 });
 
-  app.get('/tutor-profile/:email', async (req, res) => {
-    const email = req.params.email;
-    try {
-        const result = await tutorProfilesCollection.findOne({ tutorEmail: email });
-        // ডাটা না পাওয়া গেলে null এর পরিবর্তে {} পাঠান
-        res.send(result || {}); 
-    } catch (error) {
-        res.status(500).send({ message: "Error fetching profile" });
-    }
+app.get('/tutor/ongoing/:email', checkDBConnection, async (req, res) => {
+  const email = req.params.email;
+  try {
+    const result = await applicationsCollection.find({ 
+      tutorEmail: email, 
+      status: 'Approved' 
+    }).toArray();
+    res.send(result);
+  } catch (error) {
+    console.error("Ongoing tuitions error:", error);
+    res.status(500).send({ message: "Failed to fetch ongoing tuitions" });
+  }
 });
 
+app.get('/tutor-profile/:email', checkDBConnection, async (req, res) => {
+  const email = req.params.email;
+  try {
+    const result = await tutorProfilesCollection.findOne({ tutorEmail: email });
+    res.send(result || {});
+  } catch (error) {
+    console.error("Profile fetch error:", error);
+    res.status(500).send({ message: "Error fetching profile" });
+  }
+});
 
-
-// 2. Tutor Profile Create ba Update kora (Upsert use kora hoyeche)
-app.patch('/tutor-profile-update', async (req, res) => {
-    const profile = req.body;
-    const filter = { tutorEmail: profile.tutorEmail };
-    const options = { upsert: true };
-    const updateDoc = {
-        $set: {
-            name: profile.name,
-            photo: profile.photo,
-            university: profile.university,
-            specialization: profile.specialization,
-            experience: profile.experience,
-            bio: profile.bio,
-            lastUpdated: new Date()
-        },
-    };
+app.patch('/tutor-profile-update', checkDBConnection, async (req, res) => {
+  const profile = req.body;
+  const filter = { tutorEmail: profile.tutorEmail };
+  const options = { upsert: true };
+  const updateDoc = {
+    $set: {
+      name: profile.name,
+      photo: profile.photo,
+      university: profile.university,
+      specialization: profile.specialization,
+      experience: profile.experience,
+      bio: profile.bio,
+      lastUpdated: new Date()
+    },
+  };
+  
+  try {
     const result = await tutorProfilesCollection.updateOne(filter, updateDoc, options);
     res.send(result);
+  } catch (error) {
+    console.error("Profile update error:", error);
+    res.status(500).send({ message: "Failed to update profile" });
+  }
 });
 
-    app.get('/all-tutors', async (req, res) => {
-    try {
-        const result = await tutorProfilesCollection.find().toArray();
-        res.send(result);
-    } catch (error) {
-        res.status(500).send({ message: "Failed to fetch tutors" });
-    }
+app.get('/all-tutors', checkDBConnection, async (req, res) => {
+  try {
+    const result = await tutorProfilesCollection.find().toArray();
+    res.send(result);
+  } catch (error) {
+    console.error("Fetch tutors error:", error);
+    res.status(500).send({ message: "Failed to fetch tutors" });
+  }
 });
-     
-    app.get('/admin/all-tuitions', async (req, res) => {
+
+app.post('/latest-tutors', checkDBConnection, async (req, res) => {
+  try {
+    const latestTutors = await tutorProfilesCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .limit(3)
+      .toArray();
+    res.send(latestTutors);
+  } catch (error) {
+    console.error("Latest tutors error:", error);
+    res.status(500).send({ message: "Failed to fetch latest tutors" });
+  }
+});
+
+// ============ STUDENT ROUTES ============
+app.get('/student-profile/:email', checkDBConnection, async (req, res) => {
+  const email = req.params.email;
+  try {
+    const result = await userCollection.findOne({ email: email });
+    res.send(result || {});
+  } catch (error) {
+    console.error("Student profile error:", error);
+    res.status(500).send({ message: "Error fetching student profile" });
+  }
+});
+
+app.patch('/student-profile-update', checkDBConnection, async (req, res) => {
+  const profile = req.body;
+  const filter = { email: profile.email };
+  const updateDoc = {
+    $set: {
+      name: profile.name,
+      phone: profile.phone,
+      institution: profile.institution,
+      address: profile.address,
+      lastUpdated: new Date()
+    },
+  };
+  
+  try {
+    const result = await userCollection.updateOne(filter, updateDoc);
+    res.send(result);
+  } catch (error) {
+    console.error("Student profile update error:", error);
+    res.status(500).send({ message: "Update failed" });
+  }
+});
+
+app.get('/applied-tutors/:email', checkDBConnection, async (req, res) => {
+  const email = req.params.email;
+  try {
+    const result = await applicationsCollection.find({ studentEmail: email }).toArray();
+    res.send(result);
+  } catch (error) {
+    console.error("Applied tutors error:", error);
+    res.status(500).send({ message: "Failed to fetch applications" });
+  }
+});
+
+// ============ TUITION ROUTES ============
+app.get('/all-tuitions', checkDBConnection, async (req, res) => {
+  try {
+    const allTuitions = await tuitionsCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send(allTuitions);
+  } catch (error) {
+    console.error("All tuitions error:", error);
+    res.status(500).send({ message: "Failed to fetch all tuitions" });
+  }
+});
+
+app.post('/latest-tuitions', checkDBConnection, async (req, res) => {
+  try {
+    const latestTuitions = await tuitionsCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .limit(6)
+      .toArray();
+    res.send(latestTuitions);
+  } catch (error) {
+    console.error("Latest tuitions error:", error);
+    res.status(500).send({ message: "Failed to fetch latest tuitions" });
+  }
+});
+
+app.get('/tuition/:id', checkDBConnection, async (req, res) => {
+  const id = req.params.id;
+  try {
+    const query = { _id: new ObjectId(id) };
+    const result = await tuitionsCollection.findOne(query);
+    if (!result) {
+      return res.status(404).send({ message: "Tuition not found" });
+    }
+    res.send(result);
+  } catch (error) {
+    console.error("Tuition fetch error:", error);
+    res.status(500).send({ message: "Failed to fetch tuition" });
+  }
+});
+
+app.post('/tuition', checkDBConnection, async (req, res) => {
+  const post = req.body;
+  if (!post.studentEmail || !post.subject) {
+    return res.status(400).send({ message: "Missing required fields." });
+  }
+  
+  const tuitionPost = {
+    ...post,
+    createdAt: new Date(),
+    status: 'Pending',
+  };
+  
+  try {
+    const result = await tuitionsCollection.insertOne(tuitionPost);
+    res.send({ 
+      acknowledged: true, 
+      insertedId: result.insertedId, 
+      message: "Tuition post submitted successfully." 
+    });
+  } catch (error) {
+    console.error("Error posting tuition:", error);
+    res.status(500).send({ message: "Failed to post tuition." });
+  }
+});
+
+app.post('/my-tuitions', checkDBConnection, async (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).send({ message: "Student email is required." });
+  }
+  
+  try {
+    const myTuitions = await tuitionsCollection
+      .find({ studentEmail: email })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send(myTuitions);
+  } catch (error) {
+    console.error("Error fetching my tuitions:", error);
+    res.status(500).send({ message: "Failed to fetch tuitions." });
+  }
+});
+
+app.put('/tuition/:id', checkDBConnection, async (req, res) => {
+  const id = req.params.id;
+  const updatedPost = req.body;
+  const { _id, studentEmail, createdAt, ...updateDoc } = updatedPost;
+  const filter = { _id: new ObjectId(id) };
+  const updateOperation = { $set: updateDoc };
+  
+  try {
+    const result = await tuitionsCollection.updateOne(filter, updateOperation);
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: "Tuition post not found." });
+    }
+    res.send({ 
+      acknowledged: true, 
+      modifiedCount: result.modifiedCount, 
+      message: "Tuition post updated successfully." 
+    });
+  } catch (error) {
+    console.error("Error updating tuition:", error);
+    res.status(500).send({ message: "Failed to update tuition." });
+  }
+});
+
+app.delete('/tuition/:id', checkDBConnection, async (req, res) => {
+  const id = req.params.id;
+  try {
+    const result = await tuitionsCollection.deleteOne({ _id: new ObjectId(id) });
+    if (result.deletedCount === 0) {
+      return res.status(404).send({ message: "Tuition post not found." });
+    }
+    res.send({ 
+      acknowledged: true, 
+      deletedCount: result.deletedCount, 
+      message: "Tuition post deleted successfully." 
+    });
+  } catch (error) {
+    console.error("Error deleting tuition:", error);
+    res.status(500).send({ message: "Failed to delete tuition." });
+  }
+});
+
+// ============ APPLICATION ROUTES ============
+app.post('/applications', checkDBConnection, async (req, res) => {
+  const application = req.body;
+  const query = { 
+    tuitionId: application.tuitionId, 
+    tutorEmail: application.tutorEmail 
+  };
+  
+  try {
+    const existing = await applicationsCollection.findOne(query);
+    if (existing) {
+      return res.status(400).send({ message: "Already applied!" });
+    }
+    
+    const result = await applicationsCollection.insertOne({ 
+      ...application, 
+      status: 'Pending', 
+      appliedAt: new Date() 
+    });
+    res.send(result);
+  } catch (error) {
+    console.error("Application error:", error);
+    res.status(500).send({ message: "Failed to submit application" });
+  }
+});
+
+app.get('/tutor-applications/:email', checkDBConnection, async (req, res) => {
+  const email = req.params.email;
+  try {
+    const result = await applicationsCollection.find({ tutorEmail: email }).toArray();
+    res.send(result);
+  } catch (error) {
+    console.error("Tutor applications error:", error);
+    res.status(500).send({ message: "Failed to fetch applications" });
+  }
+});
+
+app.delete('/application-cancel/:id', checkDBConnection, async (req, res) => {
+  const id = req.params.id;
+  try {
+    const result = await applicationsCollection.deleteOne({ 
+      _id: new ObjectId(id), 
+      status: 'Pending' 
+    });
+    res.send(result);
+  } catch (error) {
+    console.error("Cancel application error:", error);
+    res.status(500).send({ message: "Failed to cancel application" });
+  }
+});
+
+// ============ PAYMENT ROUTES ============
+app.post('/create-checkout-session', checkDBConnection, async (req, res) => {
+  const { applicationId, amount, tutorName, studentEmail } = req.body;
+  
+  try {
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'bdt',
+          unit_amount: parseInt(amount * 100),
+          product_data: {
+            name: `Hire Tutor: ${tutorName}`
+          },
+        },
+        quantity: 1,
+      }],
+      mode: 'payment',
+      customer_email: studentEmail,
+      metadata: { applicationId: applicationId },
+      success_url: `${process.env.SITE_DOMAIN}/dashboard/student/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.SITE_DOMAIN}/dashboard/student/payment-cancelled`,
+    });
+    
+    res.send({ url: session.url });
+  } catch (error) {
+    console.error("Stripe Error:", error.message);
+    res.status(500).send({ message: error.message });
+  }
+});
+
+app.patch('/payment-verify', checkDBConnection, async (req, res) => {
+  const { session_id } = req.query;
+  
+  try {
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    
+    if (session.payment_status === 'paid') {
+      const appId = session.metadata.applicationId;
+      
+      const payment = {
+        transactionId: session.payment_intent,
+        amount: session.amount_total / 100,
+        studentEmail: session.customer_email,
+        applicationId: appId,
+        date: new Date()
+      };
+      
+      await paymentsCollection.insertOne(payment);
+      
+      const app = await applicationsCollection.findOneAndUpdate(
+        { _id: new ObjectId(appId) },
+        { $set: { status: 'Approved' } }
+      );
+      
+      if (app.value?.tuitionId) {
+        await tuitionsCollection.updateOne(
+          { _id: new ObjectId(app.value.tuitionId) },
+          { $set: { status: 'Closed' } }
+        );
+      }
+      
+      res.send({ success: true });
+    } else {
+      res.status(400).send({ message: "Payment not completed" });
+    }
+  } catch (error) {
+    console.error("Verification error:", error);
+    res.status(500).send({ message: "Verification failed" });
+  }
+});
+
+// ============ ADMIN ROUTES ============
+app.get('/admin/all-tuitions', checkDBConnection, async (req, res) => {
+  try {
     const result = await tuitionsCollection.find().sort({ createdAt: -1 }).toArray();
     res.send(result);
+  } catch (error) {
+    console.error("Admin tuitions error:", error);
+    res.status(500).send({ message: "Failed to fetch tuitions" });
+  }
 });
 
-// Update tuition status (Approve/Reject)
-app.patch('/admin/tuition-status/:id', async (req, res) => {
-    const id = req.params.id;
-    const { status } = req.body; // 'Approved' or 'Rejected'
+app.patch('/admin/tuition-status/:id', checkDBConnection, async (req, res) => {
+  const id = req.params.id;
+  const { status } = req.body;
+  
+  try {
     const result = await tuitionsCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: { status: status } }
+      { _id: new ObjectId(id) },
+      { $set: { status: status } }
     );
     res.send(result);
+  } catch (error) {
+    console.error("Status update error:", error);
+    res.status(500).send({ message: "Failed to update status" });
+  }
 });
 
-// --- ADMIN: Reports & Analytics ---
-app.get('/admin/stats', async (req, res) => {
+app.get('/admin/stats', checkDBConnection, async (req, res) => {
+  try {
     const totalEarnings = await paymentsCollection.aggregate([
-        { $group: { _id: null, total: { $sum: "$amount" } } }
+      { $group: { _id: null, total: { $sum: "$amount" } } }
     ]).toArray();
-
+    
     const totalUsers = await userCollection.countDocuments();
     const totalTuitions = await tuitionsCollection.countDocuments();
     const transactions = await paymentsCollection.find().sort({ date: -1 }).toArray();
-
-    res.send({
-        totalEarnings: totalEarnings[0]?.total || 0,
-        totalUsers,
-        totalTuitions,
-        transactions
+    
+    res.send({ 
+      totalEarnings: totalEarnings[0]?.total || 0, 
+      totalUsers, 
+      totalTuitions, 
+      transactions 
     });
+  } catch (error) {
+    console.error("Stats error:", error);
+    res.status(500).send({ message: "Failed to fetch stats" });
+  }
 });
-    // index.js (Add these inside your run() function)
-    app.get('/users', async (req, res) => {
+
+// ============ USER ROUTES ============
+app.get('/users', checkDBConnection, async (req, res) => {
+  try {
     const result = await userCollection.find().toArray();
     res.send(result);
+  } catch (error) {
+    console.error("Users fetch error:", error);
+    res.status(500).send({ message: "Failed to fetch users" });
+  }
 });
 
-// 2. Update User Information/Role
-app.patch('/users/:id', async (req, res) => {
-    const id = req.params.id;
-    const filter = { _id: new ObjectId(id) };
-    const updatedUser = req.body;
-    const updateDoc = {
-        $set: {
-            name: updatedUser.name,
-            phone: updatedUser.phone,
-            role: updatedUser.role,
-            status: updatedUser.status // e.g., 'Verified' or 'Blocked'
-        },
-    };
+app.post('/users', checkDBConnection, async (req, res) => {
+  const user = req.body;
+  const query = { email: user.email };
+  
+  try {
+    const existingUser = await userCollection.findOne(query);
+    if (existingUser) {
+      return res.send({ message: 'User already exists in DB', insertedId: null });
+    }
+    const result = await userCollection.insertOne(user);
+    res.send(result);
+  } catch (error) {
+    console.error("User creation error:", error);
+    res.status(500).send({ message: "Failed to create user" });
+  }
+});
+
+app.patch('/users/:id', checkDBConnection, async (req, res) => {
+  const id = req.params.id;
+  const filter = { _id: new ObjectId(id) };
+  const updatedUser = req.body;
+  const updateDoc = {
+    $set: {
+      name: updatedUser.name,
+      phone: updatedUser.phone,
+      role: updatedUser.role,
+      status: updatedUser.status
+    },
+  };
+  
+  try {
     const result = await userCollection.updateOne(filter, updateDoc);
     res.send(result);
+  } catch (error) {
+    console.error("User update error:", error);
+    res.status(500).send({ message: "Failed to update user" });
+  }
 });
 
-// 3. Delete User Account
-app.delete('/users/:id', async (req, res) => {
-    const id = req.params.id;
+app.delete('/users/:id', checkDBConnection, async (req, res) => {
+  const id = req.params.id;
+  try {
     const result = await userCollection.deleteOne({ _id: new ObjectId(id) });
     res.send(result);
-});
-
-// 1. Submit Application
-app.post('/applications', async (req, res) => {
-    const application = req.body;
-    // Check if tutor already applied
-    const query = { tuitionId: application.tuitionId, tutorEmail: application.tutorEmail };
-    const existing = await applicationsCollection.findOne(query);
-    if (existing) return res.status(400).send({ message: "Already applied!" });
-
-    const result = await applicationsCollection.insertOne({
-        ...application,
-        status: 'Pending',
-        appliedAt: new Date()
-    });
-    res.send(result);
-});
-
-// 2. Get Tutor's Applications
-app.get('/tutor-applications/:email', async (req, res) => {
-    const email = req.params.email;
-    const result = await applicationsCollection.find({ tutorEmail: email }).toArray();
-    res.send(result);
-});
-
-// 3. Delete Application (Before approval)
-app.delete('/application-cancel/:id', async (req, res) => {
-    const id = req.params.id;
-    const result = await applicationsCollection.deleteOne({ _id: new ObjectId(id), status: 'Pending' });
-    res.send(result);
-});
-
-// 4. Get Ongoing Tuitions (Approved ones)
-app.get('/ongoing-tuitions/:email', async (req, res) => {
-    const email = req.params.email;
-    const result = await applicationsCollection.find({ tutorEmail: email, status: 'Approved' }).toArray();
-    res.send(result);
-});
-   // index.js
-app.post('/create-checkout-session', async (req, res) => {
-    const { applicationId, amount, tutorName, studentEmail } = req.body;
-    
-    try {
-        const session = await stripe.checkout.sessions.create({
-            payment_method_types: ['card'],
-            line_items: [{
-                price_data: {
-                    currency: 'bdt',
-                    unit_amount: parseInt(amount * 100), // Stripe uses cents
-                    product_data: { name: `Hire Tutor: ${tutorName}` },
-                },
-                quantity: 1,
-            }],
-            mode: 'payment',
-            customer_email: studentEmail,
-            metadata: { applicationId: applicationId }, // Required for verify step
-            success_url: `${process.env.SITE_DOMAIN}/dashboard/student/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: `${process.env.SITE_DOMAIN}/dashboard/student/payment-cancelled`,
-        });
-        res.send({ url: session.url });
-    } catch (error) {
-        console.error("Stripe Error:", error.message);
-        res.status(500).send({ message: error.message });
-    }
-});
-
-    // --- PAYMENT VERIFICATION & DB UPDATE ---
-    app.patch('/payment-verify', async (req, res) => {
-        const { session_id } = req.query;
-        try {
-            const session = await stripe.checkout.sessions.retrieve(session_id);
-            if (session.payment_status === 'paid') {
-                const appId = session.metadata.applicationId;
-                
-                // 1. Save Payment Record
-                const payment = {
-                    transactionId: session.payment_intent,
-                    amount: session.amount_total / 100,
-                    studentEmail: session.customer_email,
-                    applicationId: appId,
-                    date: new Date()
-                };
-                await paymentsCollection.insertOne(payment);
-
-                // 2. Update Application Status
-                const app = await applicationsCollection.findOneAndUpdate(
-                    { _id: new ObjectId(appId) },
-                    { $set: { status: 'Approved' } }
-                );
-
-                // 3. Close Tuition Post
-                if (app.value?.tuitionId) {
-                    await tuitionsCollection.updateOne(
-                        { _id: new ObjectId(app.value.tuitionId) },
-                        { $set: { status: 'Closed' } }
-                    );
-                }
-                res.send({ success: true });
-            }
-        } catch (error) {
-            res.status(500).send({ message: "Verification failed" });
-        }
-    });
-    // --- GET APPLICATIONS FOR STUDENT ---
-    app.get('/applied-tutors/:email', async (req, res) => {
-        const email = req.params.email;
-        const result = await applicationsCollection.find({ studentEmail: email }).toArray();
-        res.send(result);
-    });
-    
-    // Seed sample data if collections are empty (for fresh data on first run)
-    const tuitionCount = await tuitionsCollection.countDocuments();
-    if (tuitionCount === 0) {
-        // Assume sampleTuitions is defined elsewhere or skip seeding here for brevity
-        // await tuitionsCollection.insertMany(sampleTuitions);
-        console.log("Skipped inserting sample tuition posts.");
-    }
-    
-    const tutorCount = await tutorProfilesCollection.countDocuments();
-    if (tutorCount === 0) {
-        // Assume sampleTutors is defined elsewhere or skip seeding here for brevity
-        // await tutorProfilesCollection.insertMany(sampleTutors);
-        console.log("Skipped inserting sample tutor profiles.");
-    }
-    
-    // API Endpoint to Save User Profile on Registration/Social Login
-    app.post('/users', async (req, res) => {
-        const user = req.body;
-        const query = { email: user.email };
-        const existingUser = await userCollection.findOne(query);
-
-        if (existingUser) {
-            return res.send({ message: 'User already exists in DB', insertedId: null });
-        }
-        
-        const result = await userCollection.insertOne(user);
-        res.send(result);
-    });
-    
-    // API Endpoint to Generate and Send JWT Token 
-    app.post('/jwt', async (req, res) => {
-        const user = req.body;
-        
-        // 1. Fetch user role from MongoDB
-        const dbUser = await userCollection.findOne({ email: user.email });
-        const userRole = dbUser ? dbUser.role : 'Student'; // Default to Student if role not found
-        
-        // 2. Create the payload with identifying information and the role
-        const payload = {
-            email: user.email,
-            role: userRole,
-        };
-        
-        // 3. Generate the JWT token (Requires ACCESS_TOKEN_SECRET in .env)
-        const token = jwt.sign(payload, process.env.ACCESS_TOKEN_SECRET, { expiresIn: '1h' });
-        
-        // 4. Send the token back to the client
-        res.send({ token });
-    });
-
-    app.get('/all-tuitions', async (req, res) => {
-    try {
-        const allTuitions = await tuitionsCollection
-            .find({})
-            .sort({ createdAt: -1 }) 
-            .toArray();
-        res.send(allTuitions);
-    } catch (error) {
-        res.status(500).send({ message: "Failed to fetch all tuitions" });
-    }
-});
-     app.get('/tuition/:id', async (req, res) => {
-    const id = req.params.id;
-    const query = { _id: new ObjectId(id) };
-    const result = await tuitionsCollection.findOne(query);
-    res.send(result);
-});
-
-// Get Ongoing Tuitions for Tutor (Approved status)
-app.get('/tutor/ongoing/:email', async (req, res) => {
-    const email = req.params.email;
-    const result = await applicationsCollection.find({ 
-        tutorEmail: email, 
-        status: 'Approved' 
-    }).toArray();
-    res.send(result);
-});
-
-// Get Revenue History for Tutor (Payments linked to tutor's email)
-app.get('/tutor/revenue/:email', async (req, res) => {
-    const email = req.params.email;
-    // We find payments where the application linked to the payment belongs to this tutor
-    const payments = await paymentsCollection.aggregate([
-        {
-            $lookup: {
-                from: 'applications',
-                localField: 'applicationId',
-                foreignField: '_id',
-                as: 'appDetails'
-            }
-        },
-        { $unwind: '$appDetails' },
-        { $match: { 'appDetails.tutorEmail': email } }
-    ]).toArray();
-    res.send(payments);
-});
-    app.post('/latest-tuitions', async (req, res) => { // CHANGED FROM app.get
-        // Sort by 'createdAt' time (descending) and limit to 6
-        const latestTuitions = await tuitionsCollection
-            .find({})
-            .sort({ createdAt: -1 }) 
-            .limit(6)
-            .toArray();
-        res.send(latestTuitions);
-    });
-   
-    // API: Post New Tuition (CREATE)
-    app.post('/tuition', async (req, res) => {
-        const post = req.body;
-        
-        if (!post.studentEmail || !post.subject) {
-            return res.status(400).send({ message: "Missing required fields." });
-        }
-
-        const tuitionPost = {
-            ...post,
-            createdAt: new Date(),
-            status: 'Pending', // Default status: Pending for admin review
-        };
-
-        try {
-            const result = await tuitionsCollection.insertOne(tuitionPost);
-            res.send({ 
-                acknowledged: true, 
-                insertedId: result.insertedId, 
-                message: "Tuition post submitted successfully. It is currently pending admin review." 
-            });
-        } catch (error) {
-            console.error("Error posting tuition:", error);
-            res.status(500).send({ message: "Failed to post tuition due to a server error." });
-        }
-    });
-
-    app.post('/my-tuitions', async (req, res) => {
-        const { email } = req.body;
-        if (!email) {
-            return res.status(400).send({ message: "Student email is required." });
-        }
-        try {
-            const myTuitions = await tuitionsCollection
-                .find({ studentEmail: email })
-                .sort({ createdAt: -1 }) 
-                .toArray();
-            res.send(myTuitions);
-        } catch (error) {
-            console.error("Error fetching my tuitions:", error);
-            res.status(500).send({ message: "Failed to fetch tuitions." });
-        }
-    });
-    
-    app.put('/tuition/:id', async (req, res) => {
-        const id = req.params.id;
-        const updatedPost = req.body;
-        
-        // Prepare data for update (excluding _id)
-        const { _id, studentEmail, createdAt, ...updateDoc } = updatedPost;
-
-        const filter = { _id: new ObjectId(id) };
-        const updateOperation = {
-            $set: updateDoc,
-        };
-
-        try {
-            const result = await tuitionsCollection.updateOne(filter, updateOperation);
-            
-            if (result.matchedCount === 0) {
-                return res.status(404).send({ message: "Tuition post not found." });
-            }
-
-            res.send({ 
-                acknowledged: true, 
-                modifiedCount: result.modifiedCount,
-                message: "Tuition post updated successfully." 
-            });
-        } catch (error) {
-            console.error("Error updating tuition:", error);
-            res.status(500).send({ message: "Failed to update tuition." });
-        }
-    });
-
-    // NEW API: Delete a Tuition Post (DELETE)
-    app.delete('/tuition/:id', async (req, res) => {
-        const id = req.params.id;
-        try {
-            const result = await tuitionsCollection.deleteOne({ _id: new ObjectId(id) });
-
-            if (result.deletedCount === 0) {
-                return res.status(404).send({ message: "Tuition post not found." });
-            }
-
-            res.send({ 
-                acknowledged: true, 
-                deletedCount: result.deletedCount,
-                message: "Tuition post deleted successfully." 
-            });
-        } catch (error) {
-            console.error("Error deleting tuition:", error);
-            res.status(500).send({ message: "Failed to delete tuition." });
-        }
-    });
-    
-    app.post('/latest-tutors', async (req, res) => { // CHANGED FROM app.get
-        // Sort by 'createdAt' time (descending) and limit to 3
-        const latestTutors = await tutorProfilesCollection
-            .find({})
-            .sort({ createdAt: -1 }) 
-            .limit(3)
-            .toArray();
-        res.send(latestTutors);
-    });
-
-
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
-  } finally {
-    //
+  } catch (error) {
+    console.error("User delete error:", error);
+    res.status(500).send({ message: "Failed to delete user" });
   }
+});
+
+// ============ JWT ROUTE ============
+app.post('/jwt', checkDBConnection, async (req, res) => {
+  const user = req.body;
+  
+  try {
+    const dbUser = await userCollection.findOne({ email: user.email });
+    const userRole = dbUser ? dbUser.role : 'Student';
+    
+    const payload = {
+      email: user.email,
+      role: userRole,
+    };
+    
+    const token = jwt.sign(payload, process.env.ACCESS_TOKEN_SECRET, { expiresIn: '1h' });
+    res.send({ token });
+  } catch (error) {
+    console.error("JWT error:", error);
+    res.status(500).send({ message: "Failed to generate token" });
+  }
+});
+
+// ============ 404 HANDLER ============
+app.use((req, res) => {
+  res.status(404).send({ 
+    message: "Route not found", 
+    path: req.path,
+    method: req.method 
+  });
+});
+
+// ============ ERROR HANDLER ============
+app.use((err, req, res, next) => {
+  console.error("Global error:", err);
+  res.status(500).send({ 
+    message: "Internal server error", 
+    error: process.env.NODE_ENV === 'development' ? err.message : undefined 
+  });
+});
+
+// ============ START SERVER ============
+async function startServer() {
+  const dbConnected = await connectDB();
+  
+  if (!dbConnected) {
+    console.error("Failed to connect to database. Server will start but routes will return 503.");
+  }
+  
+  app.listen(port, () => {
+    console.log(` Server listening on port ${port}`);
+  });
 }
-run().catch(console.dir);
 
-app.get('/', (req, res) => {
-  res.send('Tution is coming..')
-})
+startServer();
 
-app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`)
-})
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('Shutting down gracefully...');
+  await client.close();
+  process.exit(0);
+});
