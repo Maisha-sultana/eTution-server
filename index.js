@@ -230,27 +230,27 @@ app.get('/applied-tutors/:email', checkDBConnection, async (req, res) => {
 });
 
 // ============ TUITION ROUTES ============
-// index.js ফাইলে /all-tuitions রাউটটি নিচের কোড দিয়ে পরিবর্তন করুন
 app.get('/all-tuitions', checkDBConnection, async (req, res) => {
   try {
-    const { search, class: classFilter, sort, page = 1, limit = 6 } = req.query;
+    const { search, class: classFilter, location, sort, page = 1, limit = 6 } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
     
-    // ১. ফিল্টার কুয়েরি তৈরি (শুধুমাত্র Approved পোস্টগুলো পাবলিক হবে)
     let query = { status: 'Approved' }; 
 
-    // ২. সার্চ লজিক (Subject অনুযায়ী)
+    // Search by Subject
     if (search) {
       query.subject = { $regex: search, $options: 'i' };
     }
 
-    // ৩. ক্লাস ফিল্টার লজিক
     if (classFilter) {
-      query.classLevel = classFilter;
+      query.classLevel = { $regex: classFilter, $options: 'i' };
     }
 
-    // ৪. সর্টিং লজিক (Salary অনুযায়ী)
-    let sortOption = { createdAt: -1 }; // ডিফল্ট সর্টিং
+    if (location) {
+      query.location = { $regex: location, $options: 'i' };
+    }
+
+    let sortOption = { createdAt: -1 }; 
     if (sort === 'salaryLow') {
       sortOption = { salary: 1 };
     } else if (sort === 'salaryHigh') {
@@ -266,14 +266,13 @@ app.get('/all-tuitions', checkDBConnection, async (req, res) => {
     const total = await tuitionsCollection.countDocuments(query);
     res.send({ result, total });
   } catch (error) {
-    console.error("Fetch error:", error);
-    res.status(500).send({ message: "Failed to fetch tuitions" });
+    res.status(500).send({ message: "Fetch error" });
   }
 });
 app.post('/latest-tuitions', checkDBConnection, async (req, res) => {
   try {
     const latestTuitions = await tuitionsCollection
-      .find({ status: 'Approved' }) // শুধুমাত্র এপ্রুভ করা ডাটা 
+      .find({ status: 'Approved' }) 
       .sort({ createdAt: -1 })
       .limit(6)
       .toArray();
