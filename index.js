@@ -149,6 +149,9 @@ app.patch('/tutor-profile-update', checkDBConnection, async (req, res) => {
       bio: profile.bio,
       lastUpdated: new Date()
     },
+    $setOnInsert: {
+        createdAt: new Date() 
+      }
   };
   
   try {
@@ -462,34 +465,48 @@ app.post('/create-checkout-session', checkDBConnection, async (req, res) => {
     res.status(500).send({ message: error.message });
   }
 });
+
 app.patch('/payment-verify', checkDBConnection, async (req, res) => {
   const { session_id } = req.query;
   try {
     const session = await stripe.checkout.sessions.retrieve(session_id);
+    
     if (session.payment_status === 'paid') {
       const appId = session.metadata.applicationId;
       
-      // Tutor application approved hobe payment er por [cite: 154, 157]
+      const paymentInfo = {
+        applicationId: appId,
+        transactionId: session.payment_intent, 
+        amount: session.amount_total / 100, 
+        studentEmail: session.customer_email,
+        date: new Date(),
+        status: 'success'
+      };
+
+      await paymentsCollection.insertOne(paymentInfo);
+
       const updatedApp = await applicationsCollection.findOneAndUpdate(
         { _id: new ObjectId(appId) },
         { $set: { status: 'Approved' } },
         { returnDocument: 'after' }
       );
 
-      // Tuition post bondho hoye jabe [cite: 155]
       if (updatedApp.value?.tuitionId) {
         await tuitionsCollection.updateOne(
           { _id: new ObjectId(updatedApp.value.tuitionId) },
           { $set: { status: 'Closed' } }
         );
       }
+      
       res.send({ success: true });
+    } else {
+      res.send({ success: false, message: "Payment not paid" });
     }
   } catch (error) {
+    console.error("Payment Verify Error:", error);
     res.status(500).send({ success: false });
   }
 });
-
 // ============ ADMIN ROUTES ============
 app.get('/admin/all-tuitions', checkDBConnection, async (req, res) => {
   try {
@@ -520,7 +537,7 @@ app.patch('/admin/tuition-status/:id', checkDBConnection, async (req, res) => {
 app.get('/admin/stats', checkDBConnection, async (req, res) => {
   try {
     const totalEarnings = await paymentsCollection.aggregate([
-      { $group: { _id: null, total: { $sum: "$amount" } } }
+      { $group: { _id: null, total: { $sum: { $toDouble: "$amount" } } } }
     ]).toArray();
     
     const totalUsers = await userCollection.countDocuments();
