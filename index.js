@@ -230,29 +230,55 @@ app.get('/applied-tutors/:email', checkDBConnection, async (req, res) => {
 });
 
 // ============ TUITION ROUTES ============
+// index.js ফাইলে /all-tuitions রাউটটি নিচের কোড দিয়ে পরিবর্তন করুন
 app.get('/all-tuitions', checkDBConnection, async (req, res) => {
   try {
-    const allTuitions = await tuitionsCollection
-      .find({})
-      .sort({ createdAt: -1 })
+    const { search, class: classFilter, sort, page = 1, limit = 6 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // ১. ফিল্টার কুয়েরি তৈরি (শুধুমাত্র Approved পোস্টগুলো পাবলিক হবে)
+    let query = { status: 'Approved' }; 
+
+    // ২. সার্চ লজিক (Subject অনুযায়ী)
+    if (search) {
+      query.subject = { $regex: search, $options: 'i' };
+    }
+
+    // ৩. ক্লাস ফিল্টার লজিক
+    if (classFilter) {
+      query.classLevel = classFilter;
+    }
+
+    // ৪. সর্টিং লজিক (Salary অনুযায়ী)
+    let sortOption = { createdAt: -1 }; // ডিফল্ট সর্টিং
+    if (sort === 'salaryLow') {
+      sortOption = { salary: 1 };
+    } else if (sort === 'salaryHigh') {
+      sortOption = { salary: -1 };
+    }
+
+    const result = await tuitionsCollection.find(query)
+      .sort(sortOption)
+      .skip(skip)
+      .limit(parseInt(limit))
       .toArray();
-    res.send(allTuitions);
+      
+    const total = await tuitionsCollection.countDocuments(query);
+    res.send({ result, total });
   } catch (error) {
-    console.error("All tuitions error:", error);
-    res.status(500).send({ message: "Failed to fetch all tuitions" });
+    console.error("Fetch error:", error);
+    res.status(500).send({ message: "Failed to fetch tuitions" });
   }
 });
-
 app.post('/latest-tuitions', checkDBConnection, async (req, res) => {
   try {
     const latestTuitions = await tuitionsCollection
-      .find({})
+      .find({ status: 'Approved' }) // শুধুমাত্র এপ্রুভ করা ডাটা 
       .sort({ createdAt: -1 })
       .limit(6)
       .toArray();
     res.send(latestTuitions);
   } catch (error) {
-    console.error("Latest tuitions error:", error);
     res.status(500).send({ message: "Failed to fetch latest tuitions" });
   }
 });
@@ -437,45 +463,31 @@ app.post('/create-checkout-session', checkDBConnection, async (req, res) => {
     res.status(500).send({ message: error.message });
   }
 });
-
 app.patch('/payment-verify', checkDBConnection, async (req, res) => {
   const { session_id } = req.query;
-  
   try {
     const session = await stripe.checkout.sessions.retrieve(session_id);
-    
     if (session.payment_status === 'paid') {
       const appId = session.metadata.applicationId;
       
-      const payment = {
-        transactionId: session.payment_intent,
-        amount: session.amount_total / 100,
-        studentEmail: session.customer_email,
-        applicationId: appId,
-        date: new Date()
-      };
-      
-      await paymentsCollection.insertOne(payment);
-      
-      const app = await applicationsCollection.findOneAndUpdate(
+      // Tutor application approved hobe payment er por [cite: 154, 157]
+      const updatedApp = await applicationsCollection.findOneAndUpdate(
         { _id: new ObjectId(appId) },
-        { $set: { status: 'Approved' } }
+        { $set: { status: 'Approved' } },
+        { returnDocument: 'after' }
       );
-      
-      if (app.value?.tuitionId) {
+
+      // Tuition post bondho hoye jabe [cite: 155]
+      if (updatedApp.value?.tuitionId) {
         await tuitionsCollection.updateOne(
-          { _id: new ObjectId(app.value.tuitionId) },
+          { _id: new ObjectId(updatedApp.value.tuitionId) },
           { $set: { status: 'Closed' } }
         );
       }
-      
       res.send({ success: true });
-    } else {
-      res.status(400).send({ message: "Payment not completed" });
     }
   } catch (error) {
-    console.error("Verification error:", error);
-    res.status(500).send({ message: "Verification failed" });
+    res.status(500).send({ success: false });
   }
 });
 
@@ -556,6 +568,16 @@ app.post('/users', checkDBConnection, async (req, res) => {
   }
 });
 
+app.patch('/users/role/:id', checkDBConnection, async (req, res) => {
+    const id = req.params.id;
+    const { role } = req.body;
+    const result = await userCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { role: role } }
+    );
+    res.send(result);
+});
+
 app.patch('/users/:id', checkDBConnection, async (req, res) => {
   const id = req.params.id;
   const filter = { _id: new ObjectId(id) };
@@ -609,6 +631,29 @@ app.post('/jwt', checkDBConnection, async (req, res) => {
     res.status(500).send({ message: "Failed to generate token" });
   }
 });
+const verifyToken = (req, res, next) => {
+            if (!req.headers.authorization) {
+                return res.status(401).send({ message: 'unauthorized access' });
+            }
+            const token = req.headers.authorization.split(' ')[1];
+            jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
+                if (err) {
+                    return res.status(401).send({ message: 'unauthorized access' });
+                }
+                req.decoded = decoded;
+                next();
+            });
+        };
+
+        // 2. Verify Admin (Security)
+        const verifyAdmin = async (req, res, next) => {
+            const email = req.decoded.email;
+            const user = await userCollection.findOne({ email });
+            if (user?.role !== 'Admin') {
+                return res.status(403).send({ message: 'forbidden access' });
+            }
+            next();
+        };
 
 // ============ 404 HANDLER ============
 app.use((req, res) => {
